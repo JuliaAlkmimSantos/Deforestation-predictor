@@ -17,6 +17,7 @@ The pipeline encodes four human activity variables — distance to past deforest
 ```
 ├── pipeline/
 │   ├── AmazonDeforestationPipeline.py     # Google Earth Engine data processing
+|   |-class CNN_LSTM(nn.Module).py         # Building LSTM model
 │   ├── DeforestationCNNPipeline.py        # Unified training pipeline (CNN + CNN-LSTM)
 │   ├── DeforestationPredictorLSTM.py      # Inference pipeline
 │   ├── VariableDiagnosticAnalysis.py      # Predictor variable profiling
