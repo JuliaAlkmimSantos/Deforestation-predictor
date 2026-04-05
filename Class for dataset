@@ -1,0 +1,301 @@
+import ee
+import geemap
+
+
+
+
+class AmazonDeforestationPipeline:
+
+    def __init__(self, project_id, aoi_coords, cell_size=3000):
+        """
+        project_id : GEE project id
+        aoi_coords : list of polygon coords
+        cell_size  : grid size in meters
+        """
+
+        ee.Authenticate()
+        ee.Initialize(project=project_id)
+
+        self.cell_size = cell_size
+        self.aoi = ee.Geometry.Polygon(aoi_coords)
+
+        # Load polygon boundary
+        self.polygon = ee.FeatureCollection(
+            'projects/alien-span-474611-v8/assets/Limites_Amazonia_Legal_2024_shp'
+        )
+
+        self.grid = None
+        self.grid_with_centroids = None
+
+    # ---------------------------------------------------
+    # 1️⃣ GRID CREATION
+    # ---------------------------------------------------
+
+    def create_grid(self):
+
+        lon_lat = ee.Image.pixelLonLat()
+
+        lon_grid = lon_lat.select('longitude') \
+            .divide(self.cell_size / 111320).floor()
+
+        lat_grid = lon_lat.select('latitude') \
+            .divide(self.cell_size / 110540).floor()
+
+        grid_id_img = lon_grid.add(lat_grid.multiply(1e5)) \
+            .toInt64().rename('grid_id')
+
+        self.grid = grid_id_img.reduceToVectors(
+            geometry=self.aoi,
+            scale=self.cell_size,
+            geometryType='polygon',
+            labelProperty='grid_id'
+        )
+
+        self.grid_with_centroids = self.grid.map(self._add_centroid)
+
+        return self.grid_with_centroids
+
+    def _add_centroid(self, feature):
+        centroid = feature.geometry().centroid(5)
+        lon = centroid.coordinates().get(0)
+        lat = centroid.coordinates().get(1)
+        return feature.set({'clon': lon, 'clat': lat})
+
+    # ---------------------------------------------------
+    # 2️⃣ LABEL CREATION
+    # ---------------------------------------------------
+
+    def compute_labels(self, year):
+
+        deforestation_image = ee.Image(
+            'projects/mapbiomas-public/assets/brazil/lulc/collection10/'
+            'mapbiomas_brazil_collection10_deforestation_secondary_vegetation_v2'
+        ).clip(self.aoi)
+
+        band_name = f'classification_{year}'
+
+        classification = deforestation_image.select(band_name)
+        classification = classification.updateMask(classification.neq(7))
+
+        binary = (
+            classification.eq(1)
+            .Or(classification.eq(4))
+            .Or(classification.eq(6))
+        )
+
+        target_grid = binary.reduceRegions(
+            collection=self.grid_with_centroids,
+            reducer=ee.Reducer.max(),
+            scale=30
+        )
+
+        def set_feature(f):
+            return ee.Feature(f).set({
+                f'defor_{year}': f.get('max')
+            })
+
+        return target_grid.map(set_feature)
+
+    # ---------------------------------------------------
+    # 3️⃣ DISTANCE FUNCTIONS
+    # ---------------------------------------------------
+
+    def compute_deforestation_distance(self, year):
+
+        deforestation_image = ee.Image(
+            'projects/mapbiomas-public/assets/brazil/lulc/collection10/'
+            'mapbiomas_brazil_collection10_deforestation_secondary_vegetation_v2'
+        ).clip(self.aoi)
+
+        band_name = f'classification_{year}'
+        classification = deforestation_image.select(band_name)
+        classification = classification.unmask(0)
+
+        binary = (
+            classification.eq(1)
+            .Or(classification.eq(4))
+            .Or(classification.eq(6))
+        )
+
+        distance = binary.fastDistanceTransform(4000).sqrt()
+
+        return distance.rename(f'def_{year}')
+
+    def compute_pasture_distance(self, year):
+
+        pasture_image = ee.Image(
+            'projects/mapbiomas-public/assets/brazil/lulc/collection9/'
+            'mapbiomas_collection90_pasture_quality_v1'
+        ).clip(self.aoi)
+
+        band_name = f'pasture_quality_{year}'
+
+        pasture = pasture_image.select(band_name).unmask(0)
+        pasture_binary = pasture.gt(0)
+
+        distance = pasture_binary.fastDistanceTransform(4000).sqrt()
+
+        return distance.rename(f'past_{year}')
+
+    def compute_road_distance(self):
+
+        roads = ee.FeatureCollection(
+            'projects/alien-span-474611-v8/assets/GRIP4_Region2_vector_shp'
+        ).filterBounds(self.aoi)
+
+        roads = roads.map(lambda f: f.set('road', 1))
+
+        roads_image = roads.reduceToImage(
+            properties=["road"],
+            reducer=ee.Reducer.first()
+        ).unmask(0).clip(self.aoi)
+
+        distance = roads_image.fastDistanceTransform(4000).sqrt()
+
+        return distance.rename('road')
+
+    def compute_mining_distance(self, year):
+
+            mining_image = ee.Image(
+                "projects/mapbiomas-public/assets/brazil/lulc/collection10_1/mapbiomas_brazil_collection10_1_coverage_v1"
+            ).clip(self.aoi)
+
+            band_name = f'classification_{year}'
+            classification = mining_image.select(band_name)
+            classification = classification.unmask(0)
+
+            binary = classification.eq(30)
+
+            distance = binary.fastDistanceTransform(4000).sqrt()
+
+            return distance.rename(f'mine_{year}')
+
+    # ---------------------------------------------------
+    # 4️⃣ MULTIBAND STACK
+    # ---------------------------------------------------
+
+    def build_multiband_image(self, years):
+
+        def_bands = [self.compute_deforestation_distance(y) for y in years]
+        past_bands = [self.compute_pasture_distance(y) for y in years]
+        mine_bands = [self.compute_mining_distance(y) for y in years]
+        road_band = self.compute_road_distance()
+
+        return ee.Image.cat(def_bands + past_bands)
+
+    # ---------------------------------------------------
+    # 5️⃣ EXPORT FUNCTIONS
+    # ---------------------------------------------------
+
+    def export_multiband(self, image, description):
+
+        task = ee.batch.Export.image.toDrive(
+            image=image,
+            description=description,
+            folder='Tests_aoi2',
+            fileNamePrefix=description,
+            region=self.aoi,
+            scale=90,
+            maxPixels=1e13
+        )
+
+        task.start()
+        print("Export started.")
+
+    def export_labels(self, feature_collection, description):
+
+        task = ee.batch.Export.table.toDrive(
+            collection=feature_collection,
+            description=description,
+            folder='Tests_aoi2',
+            fileNamePrefix=description,
+            fileFormat='SHP'
+        )
+
+        task.start()
+        print("Label export started.")
+
+
+    # ---------------------------------------------------
+# 7️⃣ BUILD GRID WITH MULTIYEAR LABELS
+# ---------------------------------------------------
+
+    def build_multiyear_labels(self, years):
+
+        if self.grid_with_centroids is None:
+            raise ValueError("Run create_grid() first.")
+
+        target_all_years = self.grid_with_centroids
+
+        for year in years:
+
+            yearly_labels = self.compute_labels(year)
+
+            # Join by grid_id
+            target_all_years = target_all_years.map(
+                lambda f: f.set(
+                    yearly_labels
+                    .filter(ee.Filter.eq('grid_id', f.get('grid_id')))
+                    .first()
+                    .toDictionary()
+                )
+            )
+
+        return target_all_years
+
+
+    def export_prediction_grid(self, feature_collection, years, description):
+
+        selectors = ['grid_id', 'clon', 'clat'] + \
+                    [f'defor_{y}' for y in years]
+
+        task = ee.batch.Export.table.toDrive(
+            collection=feature_collection,
+            description=description,
+            folder='Tests_aoi2',
+            fileNamePrefix=description,
+            fileFormat='SHP',
+            selectors=selectors
+        )
+
+        task.start()
+        print("Prediction grid export started.")
+
+    def create_map(self, center_on_aoi=True, zoom=6):
+        """
+        Creates a base map centered on Brazil or AOI.
+        """
+
+        Map = geemap.Map(basemap='CartoDB.DarkMatter')
+
+        # Load Brazil boundary
+        countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+        brazil = countries.filter(ee.Filter.eq("country_na", "Brazil"))
+
+        if center_on_aoi:
+            Map.centerObject(self.aoi, zoom)
+        else:
+            Map.centerObject(brazil, 5)
+
+        # Add Brazil boundary
+        Map.addLayer(brazil, {'color': 'green'}, 'Brazil')
+
+        # Add AOI
+        Map.addLayer(self.aoi, {'color': 'black'}, 'AOI')
+
+        return Map
+
+
+    def add_layer(self, Map, ee_object, vis_params, name):
+        """
+        Adds any EE image or FeatureCollection to an existing map.
+        """
+        Map.addLayer(ee_object, vis_params, name)
+        return Map
+
+
+    def display_map(self, Map):
+        """
+        Displays the map (for notebook environments).
+        """
+        display(Map)
